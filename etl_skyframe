@@ -1,0 +1,363 @@
+import concurrent.futures.thread
+import configparser
+from datetime import datetime, timedelta
+import gc
+import pymssql
+import random
+from skyframe import SkyFrame
+import string
+import sys
+import time
+import psutil
+
+
+batch_size = 15_000
+pk_columns = ['id', 'name']
+sort_columns = ['sv_op_timestamp']
+dt = datetime.strftime(datetime.now(), '%Y%m%d%H%M%S')
+update_count = 0
+insert_count = 0
+
+def log_message(mes:str):
+    global dt
+
+    print('\n'+mes)
+
+    with open(f"D:\\programs\\{dt}_test_pandas_merge.txt", 'a') as file:
+        dt_log = datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S')
+        if 'error' in mes:
+            file.write(f"{dt_log} - ERROR - {mes}\n")
+        else:
+            file.write(f"{dt_log} - INFO - {mes}\n")
+
+def log_memory_usage():
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    log_message(f'Memory usage: RSS={mem_info.rss / (1024 * 1024)} MB, VMS={mem_info.vms / (1024 * 1024)} MB')
+
+def format_value(val):
+    return f"'{str(val)}'"
+
+def generate_data():
+    global batch_size
+
+    print("Creating Data")
+    random_range = 1_000_000 #random.randint(1_000_000, 1_000_000)
+
+    data = {
+        'id': [random.randint(0, 999999) for _ in range(random_range)],
+        'name': [''.join(random.choices(string.ascii_letters, k=random.randint(1, 24))) for _ in range(random_range)],
+        'amount': [round(random.uniform(0, 99.9), 2) for _ in range(random_range)],
+        'sv_op_timestamp': [datetime(2020, 1, 1) + timedelta(days=random.randint(0, (datetime.now() - datetime(2020, 1, 1)).days), seconds=random.randint(0, 24 * 60 * 60 - 1)) for _ in range(random_range)]
+    }
+
+    df = SkyFrame(data, chunk_size=batch_size)
+    message = f'Length of Data: {len(df)}'
+    log_message(message)
+    return df
+
+def mssql_count(settings):
+    conn = pymssql.connect(
+            server=settings['server'],
+            user=settings['username'],
+            password=settings['password'],
+            database=settings['database']
+        )
+    
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT COUNT(*) FROM dbo.mock_data WITH (NOLOCK)')
+
+    row_count = cursor.fetchone()[0]
+
+    cursor.close()
+    conn.close()
+
+    return row_count
+
+def mssql_insert(settings, df_part):
+    global batch_size, pk_columns, insert_count
+
+    try:
+        conn = pymssql.connect(
+            server=settings['server'],
+            user=settings['username'],
+            password=settings['password'],
+            database=settings['database']
+        )
+        message = "Inserting Data"
+        log_message(message)
+        cursor = conn.cursor()
+
+        insert_queries = [
+            f"INSERT INTO dbo.mock_data ({', '.join([f'[{col}]' for col in df_part.column_names])}, etl_ts) VALUES ({', '.join([format_value(row[col]) for col in df_part.column_names])}, GETDATE())"
+            for _, row in df_part.iterrows()
+        ]
+
+        for query in insert_queries:
+            cursor.execute(query)
+            insert_count += 1
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        message = f"Inserted {insert_count} rows"
+        log_message(message)
+        log_memory_usage()
+
+        del df_part
+        gc.collect()
+    except Exception as e:
+        message = "An Insert error occurred"
+        log_message(message)
+        gc.collect()
+        raise e
+
+def target_update(settings, df_part):
+    global pk_columns, update_count, batch_size
+
+    try:
+        conn = pymssql.connect(
+            server=settings['server'],
+            user=settings['username'],
+            password=settings['password'],
+            database=settings['database']
+        )
+        message = "Updating Data"
+        log_message(message)
+
+        cursor = conn.cursor(as_dict=True)
+
+        pk_values = {col: list(map(format_value, df_part.get_column(col))) for col in pk_columns}
+        condition = ' AND '.join([f"{col} IN ({', '.join(pk_values[col])})" for col in pk_columns])
+        data_found_query = f"SELECT * FROM dbo.mock_data WITH (NOLOCK) WHERE {condition}"
+
+        
+        cursor.execute(data_found_query)
+        results = cursor.fetchall()
+        if results:
+            results = {key: [d[key] for d in results] for key in results[0].keys()}
+            df_results = SkyFrame(results, batch_size)
+        else:
+            df_results = SkyFrame()
+
+        del pk_values, condition, data_found_query, results
+        gc.collect()
+
+        
+        if not df_results.empty:
+            print()
+            print(f"Found records to update")
+            new_pk = [key + '_etl_pk' for key in pk_columns]
+            for _, (pk_c, pk_n) in enumerate(zip(pk_columns, new_pk)):
+                df_part.add_column(pk_n, [str(pk).casefold() for pk in df_part.get_column(pk_c)])
+            for _, (pk_c, pk_n) in enumerate(zip(pk_columns, new_pk)):
+                df_results.add_column(pk_n, [str(pk).strip().casefold() for pk in df_results.get_column(pk_c)])
+
+            df_results = df_part.merge(df_results, on=new_pk, how='inner', suffix=("_etl_hive", "_etl_sql"))
+            df_results.rename_column(old_name='_etl_hive', new_name='', contains='_etl_hive')
+
+            for col in df_results.column_names:
+                if col not in df_part.column_names:
+                    df_results.remove_column(col)
+            
+            update_queries = [
+                f"UPDATE dbo.mock_data SET {', '.join([f'[{col}] = {format_value(row[col])}' for col in df_results.column_names if col not in pk_columns and col not in new_pk])}, etl_ts = GETDATE() WHERE {' AND '.join([f'{pk} = {format_value(row[pk])}' for pk in pk_columns])}"
+                for _, row in df_results.iterrows()
+            ]
+
+            for query in update_queries:
+                cursor.execute(query)
+                update_count += 1
+
+            conn.commit()
+            cursor.close()
+
+            
+            df_results = df_part.merge(df_results, on=new_pk, how='left', suffix=('_etl_hive', '_etl_sql'), indicator=True)
+
+            if not df_results.empty:
+                df_results.rename_column(old_name='_etl_hive', new_name='', contains='_etl_hive')
+                for col in df_results.column_names:
+                    if col not in df_part.column_names or col in new_pk:
+                        df_results.remove_column(col)
+
+                message = f"Updated {update_count} rows"
+                log_message(message)
+                log_memory_usage()
+
+                conn.close()
+                gc.collect()
+
+                mssql_insert(settings=settings, df_part=df_results)
+                del df_results
+                gc.collect()
+            else:
+                print("No records to insert after the update.")
+                input()
+        else:
+            message = "Updated 0 rows"
+            log_message(message)
+            log_memory_usage()
+
+            conn.close()
+            gc.collect()
+
+            mssql_insert(settings=settings, df_part=df_part)
+            del df_part
+            gc.collect()
+    except Exception as e:
+        message = 'An Update error occurred'
+        log_message(message)
+        gc.collect()
+        raise e
+
+if __name__ == '__main__':
+    strt_time = time.time()
+    df = generate_data()
+    data_time = time.time()
+    message = "Created Data"
+    log_message(message)
+    log_memory_usage()
+
+    message = "Connecting MSSQL"
+    log_message(message)
+    config_file = 'D:\\programs\\sql_loader\\config.ini'
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    settings = dict(config['MSSQL'])
+
+    mssql_connected_time = time.time()
+    message = "Connected MSSQL"
+    log_message(message)
+
+    message = "Sorting Data"
+    log_message(message)
+    new_pk = [p + '_etl_pk' for p in pk_columns + sort_columns]
+    for _, (pk_c, pk_n) in enumerate(zip(pk_columns + sort_columns, new_pk)):
+        df.add_column(pk_n, [str(pk).lower() for pk in df.get_column(pk_c)])
+    
+    log_memory_usage()
+
+    df.sort(new_pk, [True, True, False])
+    new_group = new_pk[:-len(sort_columns)]
+    df.groupby(new_group, first=True)
+
+    log_memory_usage()
+
+    df.remove_column(new_pk)
+    
+    print(f"Length after sorted: {len(df)}")
+    sorted_time = time.time()
+    message = "Sorted Data"
+    log_message(message)
+    log_memory_usage()
+
+    row_count = mssql_count(settings=settings)
+
+    """
+    #Single Thread
+    if row_count > 0:
+        target_update(settings, df)
+    else:
+        mssql_insert(settings=settings, df_part=df)
+
+    run_time = time.time()
+    """
+
+    #Multi Thread
+    try:
+        #row_count = mssql_count(settings=settings)
+
+        if row_count > 0:
+            print("Running MultiThreading Update")
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                #future_to_df_part = []
+                #for i in range(0, len(sorted_records), batch_size):
+                #    part = sorted_records.iloc[i:i+batch_size, :]
+                #    print(part._is_view)
+                #    future_to_df_part.append(executor.submit(target_update, settings, part))
+                future_to_df_part = {executor.submit(target_update, settings, batch): batch for batch in df.slice_batch(batch_size)}
+
+                print(f'Length of futures: {len(future_to_df_part)}')
+
+                log_memory_usage()
+
+                for future in concurrent.futures.as_completed(future_to_df_part):
+                    try:
+                        future.result()
+
+                        del future_to_df_part[future]
+                        gc.collect()
+                    except Exception as error:
+                        print(f"Caught an exception: {error}")
+                        executor.shutdown(wait=True, cancel_futures=True)
+
+                        del future_to_df_part[future]
+                        gc.collect()
+                        
+                        raise error
+            
+            del df, future_to_df_part, future
+            gc.collect()
+
+            log_memory_usage()
+            run_time = time.time()
+        else:
+            print("Running MultiThreading Insert")
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_to_df_part = {executor.submit(mssql_insert, settings, batch): batch for batch in df.slice_batch(batch_size)}
+
+                for future in concurrent.futures.as_completed(future_to_df_part):
+                    try:
+                        future.result()
+
+                        del future_to_df_part[future]
+                        gc.collect()
+                    except Exception as error:
+                        print(f"Caught an exception: {error}")
+                        executor.shutdown(wait=True, cancel_futures=True)
+
+                        del future_to_df_part[future]
+                        gc.collect()
+
+                        raise error
+            
+            del df, future_to_df_part, future
+            gc.collect()
+        
+            log_memory_usage()
+            run_time = time.time()
+    except Exception as error:
+        log_message(f"An error occurred: {error}")
+        sys.exit(1)
+        #raise
+
+    end_time = time.time()
+
+    message = f'Generate Data: {timedelta(seconds=(data_time - strt_time))}'
+    log_message(message)
+    
+    message = f'MSSQL Connection: {timedelta(seconds=(mssql_connected_time - strt_time))}'
+    log_message(message)
+    
+    message = f'Sorted Data: {timedelta(seconds=(sorted_time - strt_time))}'
+    log_message(message)
+
+    message = f'Updated: {timedelta(seconds=(run_time - strt_time))}'
+    log_message(message)
+    
+    message = f'Total time: {timedelta(seconds=(end_time - strt_time))}'
+    log_message(message)
+
+    message = f'Completed Successful: {update_count} updates, {insert_count} inserts'
+    log_message(message)
+    log_memory_usage()
+    print()
+
+    all_var = dir()
+
+    for var in all_var:
+        if not var.startswith('__'):
+            print(f"{var} - {sys.getsizeof(eval(var))}")
